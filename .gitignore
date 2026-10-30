@@ -1,0 +1,11 @@
+# 运行时产物（不应进版本库）
+*.log
+*.log.*
+cache.db
+config.yaml
+config.runtime.yaml
+*.pid
+
+# 本地试验目录
+/tmp/
+tmp/

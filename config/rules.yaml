@@ -1,0 +1,34 @@
+# ==============================================================================
+# simple-proxy · 规则
+#
+# 规则由 mihomo 按顺序匹配，第一条命中即生效。
+#
+# 设计取向：默认「人控制」——除内网外全部走隧道，不做智能分流。
+# 想让国内站点直连，在 MATCH 之前加一行：  - GEOIP,CN,DIRECT
+# 想让某些域名走隧道而其它直连，见下方注释示例。
+#
+# ⚠️ 内网直连规则是安全底线，不要删除：
+#    平台的 API / K8s 服务 / 镜像仓库一旦被送进隧道就会失联。
+# ==============================================================================
+rules:
+  # ── 内网 / 本地：必须直连 ────────────────────────────────────
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - IP-CIDR6,fc00::/7,DIRECT,no-resolve
+  - IP-CIDR6,fe80::/10,DIRECT,no-resolve
+
+  # ── 其余一律走隧道 ────────────────────────────────────────────
+  - MATCH,PROXY
+
+# ── 备选写法（取消注释其中一段，并注释掉上面的 MATCH,PROXY）────────────
+#
+# A) 国内站点直连：
+#   - GEOIP,CN,DIRECT
+#   - MATCH,PROXY
+#
+# B) 只让指定域名走隧道（其余直连）：
+#   - DOMAIN-SUFFIX,openai.com,PROXY
+#   - DOMAIN-SUFFIX,anthropic.com,PROXY
+#   - MATCH,DIRECT

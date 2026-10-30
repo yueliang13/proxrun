@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# simple-proxy — 极简 HTTP 代理工具
+#
+#   simple-proxy on <cmd> [...]         让一条命令走代理（一次性：跑完自动停隧道）
+#   simple-proxy on --start <cmd> [...]  同上，但隧道常驻（可连续跑多条命令）
+#   simple-proxy off                    关闭代理（停止 mihomo）
+#   simple-proxy status                 查看状态
+#   simple-proxy check                  自检/诊断
+#   simple-proxy logs                   查看最近的路由决策日志
+#   simple-proxy update <URL>           更新订阅配置
+#   simple-proxy install                安装/初始化
+#   simple-proxy uninstall              卸载
+#
+# 设计原则见 docs/DESIGN.md
+# ==============================================================================
+set -uo pipefail
+
+SP_SELF="${BASH_SOURCE[0]}"
+SP_SCRIPT_DIR="$(cd "$(dirname "$SP_SELF")" && pwd)"
+SP_REPO_DIR="$(cd "$SP_SCRIPT_DIR/.." && pwd)"
+
+# 定位资源文件：先找已安装的数据目录（安装时会扁平化到数据目录），再找源码仓库
+_sp_asset() {
+  local rel="$1" base c
+  base="$(basename "$rel")"
+  for c in "${SP_DATA_DIR:-$HOME/.local/share/simple-proxy}/$rel" \
+           "${SP_DATA_DIR:-$HOME/.local/share/simple-proxy}/$base" \
+           "$SP_REPO_DIR/$rel"; do
+    [[ -r "$c" ]] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+
+# shellcheck source=lib/core.sh
+. "$(_sp_asset lib/core.sh 2>/dev/null || echo "$SP_REPO_DIR/lib/core.sh")"
+
+usage() {
+  cat <<'EOF'
+simple-proxy — 极简 HTTP 代理工具
+
+用法:
+  simple-proxy on <cmd> [args...]         让一条命令走代理（一次性）
+  simple-proxy on --start <cmd> [args...]  同上，但隧道常驻
+  simple-proxy off                        关闭代理
+  simple-proxy status                     查看状态
+  simple-proxy check                      自检/诊断
+  simple-proxy logs [N]                   查看最近 N 行路由日志（默认 50）
+  simple-proxy update <订阅URL>           更新订阅配置
+  simple-proxy install [选项]             安装/初始化
+  simple-proxy uninstall                  卸载
+
+install 选项:
+  --subscription <URL>   订阅地址（也可用环境变量 SIMPLE_PROXY_SUBSCRIPTION）
+  --no-shell             不写入 shell 集成（不修改 ~/.zshrc / ~/.bashrc）
+  --port <N>             HTTP 代理端口（默认 7890）
+  --no-download          不下载 mihomo 内核（假设已自行安装）
+
+shell 集成（可选，安装时写入）提供三个快捷命令:
+  proxy-on  = simple-proxy on
+  proxy-off = simple-proxy off
+  proxy-status = simple-proxy status
+EOF
+}
+
+# ── on ───────────────────────────────────────────────────────────────────────
+cmd_on() {
+  local keep=0
+  if [[ "${1:-}" == "--start" ]]; then keep=1; shift; fi
+  if (( $# == 0 )); then
+    echo "用法: simple-proxy on <cmd> [args...]" >&2
+    echo "      simple-proxy on --start <cmd> [args...]" >&2
+    return 1
+  fi
+
+  sp_load_config
+  sp_start || return 1
+
+  # 代理变量只注入子进程；父 shell 环境保持干净
+  ( sp_env; exec "$@" )
+  local rc=$?
+
+  # 默认一次性：命令跑完就停隧道；--start 则保持常驻
+  (( keep )) || sp_stop
+  return $rc
+}
+
+# ── off / status / logs ──────────────────────────────────────────────────────
+cmd_off() {
+  sp_load_config
+  sp_stop
+  echo "✅ 代理已关闭" >&2
+}
+
+cmd_status() {
+  sp_load_config
+  sp_status
+}
+
+cmd_logs() {
+  sp_load_config
+  local n="${1:-50}"
+  if [[ ! -f "$SP_LOG_FILE" ]]; then
+    echo "（还没有日志）" >&2
+    return 0
+  fi
+  # 默认只看路由决策行，噪音更少
+  grep '\[TCP\]' "$SP_LOG_FILE" 2>/dev/null | tail -n "$n" || tail -n "$n" "$SP_LOG_FILE"
+}
+
+cmd_check() {
+  sp_load_config
+  sp_check
+}
+
+# ── update ───────────────────────────────────────────────────────────────────
+cmd_update() {
+  sp_load_config
+  local url="${1:-${SIMPLE_PROXY_SUBSCRIPTION:-}}"
+  if [[ -z "$url" ]]; then
+    echo "用法: simple-proxy update <订阅URL>" >&2
+    return 1
+  fi
+  SP_DATA_DIR="$SP_DATA_DIR" bash "$SP_SCRIPT_DIR/../scripts/update-subscription.sh" "$url" "$SP_SUBSCRIPTION_CONFIG"
+}
+
+# ── install / uninstall ──────────────────────────────────────────────────────
+cmd_install() {
+  local sub="" want_shell=1 do_download=1 port=""
+  while (( $# )); do
+    case "$1" in
+      --subscription) sub="$2"; shift 2;;
+      --no-shell) want_shell=0; shift;;
+      --no-download) do_download=0; shift;;
+      --port) port="$2"; shift 2;;
+      *) echo "未知选项: $1" >&2; return 1;;
+    esac
+  done
+
+  sp_load_config
+  mkdir -p "$SP_BIN_DIR" "$SP_DATA_DIR" "$SP_CONFIG_DIR"
+
+  # ① 默认配置
+  local src_conf src_rules
+  src_conf="$(_sp_asset config/proxy.conf || echo "$SP_REPO_DIR/config/proxy.conf")"
+  src_rules="$(_sp_asset config/rules.yaml || echo "$SP_REPO_DIR/config/rules.yaml")"
+  [[ -f "$SP_CONF_FILE" ]] || cp "$src_conf" "$SP_CONF_FILE"
+  [[ -f "$SP_RULES_FILE" ]] || cp "$src_rules" "$SP_RULES_FILE"
+  for f in lib/build-config.py lib/shell.sh scripts/clean-logs.sh scripts/update-subscription.sh; do
+    local src; src="$(_sp_asset "$f" || echo "$SP_REPO_DIR/$f")"
+    [[ -r "$src" ]] && install -m 755 "$src" "$SP_DATA_DIR/$(basename "$f")"
+  done
+  chmod +x "$SP_DATA_DIR"/*.sh "$SP_DATA_DIR"/*.py 2>/dev/null
+
+  # ② 端口
+  if [[ -n "$port" ]]; then
+    if grep -q '^SP_HTTP_PORT=' "$SP_CONF_FILE"; then
+      sed -i "s/^SP_HTTP_PORT=.*/SP_HTTP_PORT=$port/" "$SP_CONF_FILE"
+    else
+      echo "SP_HTTP_PORT=$port" >> "$SP_CONF_FILE"
+    fi
+  fi
+
+  # ③ 内核
+  if (( do_download )); then
+    local os arch url
+    case "$(uname -s)" in
+      Linux)  os=linux;;
+      Darwin) os=darwin;;
+      *) echo "❌ 暂不支持的系统: $(uname -s)" >&2; return 1;;
+    esac
+    case "$(uname -m)" in
+      x86_64|amd64) arch=x86_64;;
+      aarch64|arm64) arch=aarch64;;
+      *) echo "❌ 暂不支持的架构: $(uname -m)" >&2; return 1;;
+    esac
+    url="https://github.com/MetaCubeX/mihomo/releases/download/v${SP_MIHOMO_VERSION}/mihomo-${os}-${arch}-compatible-v${SP_MIHOMO_VERSION}.gz"
+    echo "→ 下载 mihomo v${SP_MIHOMO_VERSION} (${os}/${arch}) ..." >&2
+    if curl -fsSL --max-time 300 -o /tmp/mihomo.gz "$url"; then
+      gunzip -f /tmp/mihomo.gz && install -m 755 /tmp/mihomo.gz "$SP_MIHOMO_BIN" && rm -f /tmp/mihomo.gz
+      echo "✅ mihomo 已安装: $SP_MIHOMO_BIN" >&2
+    else
+      echo "❌ mihomo 下载失败（可稍后重试，或用 --no-download 自行安装）" >&2
+      rm -f /tmp/mihomo.gz
+    fi
+  fi
+
+  # ④ 订阅
+  if [[ -n "$sub" ]]; then
+    bash "$SP_DATA_DIR/update-subscription.sh" "$sub" "$SP_SUBSCRIPTION_CONFIG" || true
+  fi
+
+  # ⑤ shell 集成
+  if (( want_shell )); then
+    local rc=""
+    case "${SHELL:-}" in
+      */zsh) rc="${ZDOTDIR:-$HOME}/.zshrc";;
+      *)     rc="$HOME/.bashrc";;
+    esac
+    local block='
+# ─── simple-proxy ───
+if [ -r "$HOME/.local/share/simple-proxy/shell.sh" ]; then
+  . "$HOME/.local/share/simple-proxy/shell.sh"
+fi'
+    cp "$(_sp_asset lib/shell.sh || echo "$SP_REPO_DIR/lib/shell.sh")" "$SP_DATA_DIR/shell.sh"
+    if ! grep -q 'simple-proxy/shell.sh' "$rc" 2>/dev/null; then
+      printf '%s\n' "$block" >> "$rc"
+      echo "✅ shell 集成已写入: $rc" >&2
+    else
+      echo "• shell 集成已存在: $rc" >&2
+    fi
+  fi
+
+  echo "" >&2
+  echo "完成。接下来：" >&2
+  echo "  1) 填订阅地址:  simple-proxy update '<URL>'   （或安装时用 --subscription）" >&2
+  echo "  2) 自检:        simple-proxy check" >&2
+  echo "  3) 使用:        simple-proxy on curl https://api.ipify.org" >&2
+  return 0
+}
+
+cmd_uninstall() {
+  sp_load_config
+  sp_stop
+  rm -f "$SP_MIHOMO_BIN"
+  echo "✅ 已移除 mihomo 与进程" >&2
+  echo "  数据与配置保留在: $SP_DATA_DIR / $SP_CONFIG_DIR（可自行删除）" >&2
+}
+
+# ── 入口 ─────────────────────────────────────────────────────────────────────
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    on)      cmd_on "$@" ;;
+    off)     cmd_off "$@" ;;
+    status)  cmd_status "$@" ;;
+    check)   cmd_check "$@" ;;
+    logs)    cmd_logs "$@" ;;
+    update)  cmd_update "$@" ;;
+    install) cmd_install "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    help|-h|--help) usage ;;
+    *) echo "未知命令: $cmd" >&2; usage >&2; return 1 ;;
+  esac
+}
+
+main "$@"
