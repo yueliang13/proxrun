@@ -9,3 +9,7 @@ config.runtime.yaml
 # 本地试验目录
 /tmp/
 tmp/
+
+# Python 缓存
+__pycache__/
+*.pyc
