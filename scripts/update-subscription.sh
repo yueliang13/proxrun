@@ -1,26 +1,17 @@
 #!/usr/bin/env bash
-# simple-proxy · 更新订阅配置
-#   用法: update-subscription.sh <订阅URL> [目标文件]
+# 原子更新订阅；临时文件在写入前即为 600，失败时保留原订阅。
 set -euo pipefail
-
 SUB_URL="${1:-${SIMPLE_PROXY_SUBSCRIPTION:-}}"
-DATA_DIR="${SIMPLE_PROXY_DATA_DIR:-$HOME/.local/share/simple-proxy}"
+DATA_DIR="${SP_DATA_DIR:-${SIMPLE_PROXY_DATA_DIR:-$HOME/.local/share/simple-proxy}}"
 TARGET="${2:-$DATA_DIR/config.yaml}"
-
-if [[ -z "$SUB_URL" ]]; then
-  echo "用法: update-subscription.sh <订阅URL>" >&2
-  echo "  或设置环境变量 SIMPLE_PROXY_SUBSCRIPTION" >&2
-  exit 1
-fi
-
-mkdir -p "$DATA_DIR"
-echo "→ 拉取订阅: ${SUB_URL%%\?*}" >&2   # 不打印 token 部分
-if curl -fsSL --max-time 60 -o "$TARGET.tmp" "$SUB_URL"; then
-  mv "$TARGET.tmp" "$TARGET"
-  chmod 600 "$TARGET"       # 含节点凭据
-  echo "✅ 订阅已更新: $TARGET (mode 600)" >&2
-else
-  rm -f "$TARGET.tmp"
-  echo "❌ 订阅拉取失败" >&2
-  exit 1
-fi
+[[ -n "$SUB_URL" ]] || { echo '用法: simple-proxy update <订阅URL>' >&2; exit 1; }
+mkdir -p "$(dirname "$TARGET")"
+umask 077
+temporary="$(mktemp "$TARGET.XXXXXX.tmp")"
+trap 'rm -f "$temporary"' EXIT
+# URL 路径也可能含凭据，不输出订阅地址。
+curl -fsSL --max-time 60 -o "$temporary" "$SUB_URL"
+[[ -s "$temporary" ]] || { echo '❌ 订阅内容为空' >&2; exit 1; }
+chmod 600 "$temporary"
+mv -f "$temporary" "$TARGET"
+echo '✅ 订阅已更新' >&2

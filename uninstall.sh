@@ -1,36 +1,32 @@
 #!/usr/bin/env bash
-# simple-proxy · 卸载
-#   bash uninstall.sh [--purge]
-#     --purge  连同数据与配置一起删除
-set -uo pipefail
-
+# bash uninstall.sh [--purge]
+set -euo pipefail
+SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SP_BIN_DIR="${SP_BIN_DIR:-$HOME/.local/bin}"
 SP_DATA_DIR="${SP_DATA_DIR:-$HOME/.local/share/simple-proxy}"
 SP_CONFIG_DIR="${SP_CONFIG_DIR:-$HOME/.config/simple-proxy}"
 PURGE=0
-[[ "${1:-}" == "--purge" ]] && PURGE=1
-
-# 停止进程
-if [[ -f "$SP_DATA_DIR/mihomo.pid" ]]; then
-  kill "$(cat "$SP_DATA_DIR/mihomo.pid")" 2>/dev/null && echo "✅ 已停止 mihomo"
-  rm -f "$SP_DATA_DIR/mihomo.pid"
+case "${1:-}" in --purge) PURGE=1;; '') ;; *) echo '用法: uninstall.sh [--purge]' >&2; exit 1;; esac
+# 统一使用带进程身份验证的停止逻辑。
+if [[ -x "$SP_BIN_DIR/simple-proxy" ]]; then
+  "$SP_BIN_DIR/simple-proxy" off
+elif [[ -f "$SOURCE_DIR/bin/simple-proxy" ]]; then
+  bash "$SOURCE_DIR/bin/simple-proxy" off
 fi
-
-rm -f "$SP_BIN_DIR/simple-proxy" "$SP_BIN_DIR/mihomo"
-echo "✅ 已移除命令与内核"
-
-# 清理 shell 集成
 for rc in "${ZDOTDIR:-$HOME}/.zshrc" "$HOME/.bashrc"; do
   [[ -f "$rc" ]] || continue
-  if grep -q 'simple-proxy/shell.sh' "$rc"; then
-    sed -i '/# ─── simple-proxy ───/,+3d' "$rc"
-    echo "✅ 已清理 shell 集成: $rc"
-  fi
+  python3 - "$rc" <<'PY'
+from pathlib import Path
+import re,sys
+p=Path(sys.argv[1]);s=p.read_text()
+s=re.sub(r'\n?# ─── simple-proxy ───\nif \[ -r .*?\nfi\n?', '\n', s, flags=re.S)
+p.write_text(s)
+PY
 done
-
+rm -f "$SP_BIN_DIR/simple-proxy" "$SP_BIN_DIR/mihomo"
 if (( PURGE )); then
+  [[ -n "$SP_DATA_DIR" && "$SP_DATA_DIR" != / && "$SP_DATA_DIR" != "$HOME" ]] || exit 1
+  [[ -n "$SP_CONFIG_DIR" && "$SP_CONFIG_DIR" != / && "$SP_CONFIG_DIR" != "$HOME" ]] || exit 1
   rm -rf "$SP_DATA_DIR" "$SP_CONFIG_DIR"
-  echo "✅ 已删除数据与配置"
-else
-  echo "• 数据与配置保留: $SP_DATA_DIR / $SP_CONFIG_DIR（加 --purge 可一并删除）"
 fi
+echo '✅ 已卸载'

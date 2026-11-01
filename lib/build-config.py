@@ -1,161 +1,154 @@
 #!/usr/bin/env python3
-"""
-simple-proxy · 运行时配置生成器
-
-把「订阅配置」+「用户规则」合并成 mihomo 实际加载的运行时配置。
-
-  config.yaml (订阅)  ┐
-  rules.yaml  (用户)  ┼─►  config.runtime.yaml
-  本地修正(DNS/端口)  ┘
-
-设计要点:
-  * 订阅配置被覆盖时，用户的规则不受影响（规则在独立文件里）
-  * DNS 优先使用系统解析器（与直连行为一致），再叠加可配置的备用解析器
-  * 默认只暴露 HTTP 代理端口，关闭控制 API
-  * 输出文件权限 600（内含节点凭据）
-"""
+"""订阅只提供节点；运行范围、DNS、规则由本地策略决定。"""
 from __future__ import annotations
 
 import argparse
 import os
-import re
+from pathlib import Path
+import shlex
 import sys
+import tempfile
 
-DEFAULT_DNS_FALLBACKS = [
-    "https://1.1.1.1/dns-query",
-    "https://8.8.8.8/dns-query",
+sys.path.insert(0, str(Path(__file__).resolve().parent / "vendor"))
+sys.path.insert(0, str(Path(os.environ.get("SP_DATA_DIR", str(Path.home() / ".local/share/simple-proxy"))) / "vendor"))
+try:
+    import yaml
+except ImportError:
+    sys.exit("❌ 缺少 PyYAML，请重新运行 install.sh，或安装 requirements.txt 中的依赖")
+
+DEFAULT_DNS_FALLBACKS = ["https://doh.pub/dns-query", "https://dns.alidns.com/dns-query"]
+PRIVATE_RULES = [
+    "DOMAIN-SUFFIX,localhost,DIRECT",
+    "DOMAIN-SUFFIX,local,DIRECT",
+    "DOMAIN-SUFFIX,svc,DIRECT",
+    "DOMAIN-SUFFIX,cluster.local,DIRECT",
+    "IP-CIDR,127.0.0.0/8,DIRECT",
+    "IP-CIDR,10.0.0.0/8,DIRECT",
+    "IP-CIDR,172.16.0.0/12,DIRECT",
+    "IP-CIDR,192.168.0.0/16,DIRECT",
+    "IP-CIDR,169.254.0.0/16,DIRECT",
+    "IP-CIDR6,::1/128,DIRECT",
+    "IP-CIDR6,fc00::/7,DIRECT",
+    "IP-CIDR6,fe80::/10,DIRECT",
 ]
 
 
-# ── 工具 ─────────────────────────────────────────────────────────────────────
-def system_resolver() -> str | None:
-    """读取系统 DNS（/etc/resolv.conf 的第一个 nameserver）。"""
+class UniqueLoader(yaml.SafeLoader):
+    pass
+
+
+def unique_mapping(loader, node, deep=False):
+    loader.flatten_mapping(node)
+    result = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in result:
+            raise ValueError(f"YAML 字段重复: {key}")
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+
+UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, unique_mapping)
+
+
+def load(text):
+    value = yaml.load(text, Loader=UniqueLoader)
+    if not isinstance(value, dict):
+        raise ValueError("配置必须是 YAML 对象")
+    return value
+
+
+def system_resolver():
     try:
-        with open("/etc/resolv.conf", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("nameserver"):
-                    parts = line.split()
-                    if len(parts) > 1:
-                        return parts[1]
+        for line in Path('/etc/resolv.conf').read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == 'nameserver':
+                return parts[1]
     except OSError:
         pass
     return None
 
 
-def read(path: str) -> str:
-    with open(path, encoding="utf-8") as f:
-        return f.read()
-
-
-# ── 规则注入 ─────────────────────────────────────────────────────────────────
-def inject_rules(src: str, rules_text: str) -> str:
-    """用用户规则整体替换订阅里的 rules 段。"""
-    rules = rules_text.rstrip() + "\n"
-    idx = src.find("\nrules:")
-    if idx == -1:
-        return src.rstrip() + "\n" + rules
-    return src[:idx].rstrip() + "\n" + rules
-
-
-# ── DNS 修正 ─────────────────────────────────────────────────────────────────
-def patch_dns(src: str, fallbacks: list[str]) -> str:
-    """
-    订阅通常使用境外 DoH（1.1.1.1 / 8.8.8.8），在部分网络环境下不可直连，
-    而直连域名需要本地解析 → 会整体解析失败。
-
-    修正：首选系统解析器（与容器/主机直连行为一致），再叠加备用解析器。
-    走代理的域名由远端解析，不受本地污染影响。
-    """
-    resolver = system_resolver()
-    items = []
-    if resolver:
-        items.append(f"    - {resolver}\n")
-    for fb in fallbacks:
-        items.append(f"    - {fb}\n")
-
-    default_items = f"    - {resolver}\n" if resolver else "    - 223.5.5.5\n"
-
-    # nameserver 列表
-    src = re.sub(
-        r"(?m)^  nameserver:\n(?:    - .*\n)+",
-        "  nameserver:\n" + "".join(items),
-        src,
-        count=1,
-    )
-    # default-nameserver（用于解析 nameserver 自身的主机名）
-    src = re.sub(
-        r"(?m)^  default-nameserver:\n(?:    - .*\n)+",
-        "  default-nameserver:\n" + default_items,
-        src,
-        count=1,
-    )
-    return src
-
-
-# ── 端口 / API 收窄 ──────────────────────────────────────────────────────────
-def patch_ports(src: str, http_port: int, enable_api: bool) -> str:
-    # mixed-port(同时开 SOCKS) → port(仅 HTTP)
-    src = re.sub(r"(?m)^mixed-port:\s*\d+\s*$", f"port: {http_port}", src, count=1)
-    src = re.sub(r"(?m)^socks-port:\s*\d+\s*$", "", src, count=1)
+def merge(subscription, policy, port, fallbacks, enable_api=False):
+    if not 1 <= port <= 65535:
+        raise ValueError("HTTP 端口必须在 1–65535 之间")
+    rules = policy.get('rules')
+    if not isinstance(rules, list) or not rules or not all(isinstance(r, str) for r in rules):
+        raise ValueError("用户 rules 必须是非空字符串列表")
+    # 与字段顺序、缩进和订阅 mode 无关。订阅仅能提供节点及其引用数据。
+    config = {key: subscription[key] for key in (
+        'proxies', 'proxy-providers', 'proxy-groups', 'rule-providers',
+    ) if key in subscription}
+    nodes = config.get('proxies', [])
+    providers = config.get('proxy-providers', {})
+    groups = config.get('proxy-groups', [])
+    if not isinstance(nodes, list) or not isinstance(providers, dict) or not isinstance(groups, list):
+        raise ValueError("订阅的节点、代理组或 provider 格式错误")
+    names = [node['name'] for node in nodes if isinstance(node, dict)
+             and isinstance(node.get('name'), str)
+             and str(node.get('type', '')).lower() not in ('direct', 'reject', 'reject-drop')]
+    if not names and not providers:
+        raise ValueError("订阅中没有可用代理节点")
+    group = {'name': 'PROXY', 'type': 'select'}
+    if names:
+        group['proxies'] = names
+    if providers:
+        group['use'] = list(providers)
+    config['proxy-groups'] = [g for g in groups if isinstance(g, dict) and g.get('name') != 'PROXY'] + [group]
+    config.update({'port': port, 'allow-lan': False, 'bind-address': '127.0.0.1',
+                   'mode': 'rule', 'log-level': 'info', 'ipv6': False,
+                   'profile': {'store-selected': False, 'store-fake-ip': False}})
     if enable_api:
-        src = re.sub(
-            r"(?m)^# external-controller:.*$",
-            f"external-controller: 127.0.0.1:9090",
-            src,
-            count=1,
-        )
-    else:
-        src = re.sub(
-            r"(?m)^external-controller:.*$",
-            "# external-controller: 已关闭（减少暴露面）",
-            src,
-            count=1,
-        )
-        # secret 字段没有意义了
-        src = re.sub(r"(?m)^secret:.*$\n?", "", src, count=1)
-    return src
+        secret = subscription.get('secret')
+        if not isinstance(secret, str) or not secret.strip():
+            raise ValueError("启用控制 API 前，必须在订阅中设置非空 secret")
+        config['external-controller'] = '127.0.0.1:9090'
+        config['secret'] = secret
+    resolver = system_resolver() or '223.5.5.5'
+    config['dns'] = {'enable': True, 'ipv6': False, 'enhanced-mode': 'redir-host',
+                     'default-nameserver': [resolver],
+                     'nameserver': list(dict.fromkeys([resolver] + fallbacks))}
+    # 内网豁免始终先于用户规则；主动解析域名，IP 规则才能兜底保护内网。
+    config['rules'] = list(dict.fromkeys(PRIVATE_RULES + rules))
+    return config
 
 
-# ── 主流程 ───────────────────────────────────────────────────────────────────
-def main() -> int:
-    ap = argparse.ArgumentParser(description="生成 mihomo 运行时配置")
-    ap.add_argument("--subscription-config", required=True)
-    ap.add_argument("--rules", required=True)
-    ap.add_argument("--output", required=True)
-    ap.add_argument("--dns-fallbacks", nargs="*", default=DEFAULT_DNS_FALLBACKS)
-    ap.add_argument("--http-port", type=int, default=7890)
-    ap.add_argument("--enable-api", default="0")
-    ap.add_argument("--data-dir", default=None)
-    args = ap.parse_args()
-
-    for p in (args.subscription_config, args.rules):
-        if not os.path.exists(p):
-            print(f"❌ 缺少文件: {p}", file=sys.stderr)
-            return 1
-
-    src = read(args.subscription_config)
-    rules = read(args.rules)
-    fallbacks = list(args.dns_fallbacks or [])
-
-    merged = inject_rules(src, rules)
-    merged = patch_dns(merged, fallbacks)
-    merged = patch_ports(merged, args.http_port, str(args.enable_api) in ("1", "true", "yes"))
-
-    tmp = args.output + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(merged)
-    os.replace(tmp, args.output)
+def atomic_write(path, text):
+    path = Path(path)
+    fd, temporary = tempfile.mkstemp(prefix=path.name + '.', suffix='.tmp', dir=path.parent)
     try:
-        os.chmod(args.output, 0o600)
-    except OSError:
-        pass
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
-    n_rules = sum(1 for l in rules.splitlines() if l.strip().startswith("- "))
-    print(f"✅ 运行时配置已生成: {args.output}", file=sys.stderr)
-    print(f"   规则 {n_rules} 条 | HTTP 端口 {args.http_port} | 控制 API {'开' if str(args.enable_api) in ('1','true','yes') else '关'}", file=sys.stderr)
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--subscription-config', required=True)
+    parser.add_argument('--rules', required=True)
+    parser.add_argument('--output', required=True)
+    parser.add_argument('--http-port', type=int, default=7890)
+    parser.add_argument('--dns-fallbacks', nargs='*', default=DEFAULT_DNS_FALLBACKS)
+    parser.add_argument('--enable-api', default='0')
+    parser.add_argument('--data-dir')  # 保留旧调用兼容性
+    args = parser.parse_args()
+    try:
+        subscription = load(Path(args.subscription_config).read_text())
+        policy = load(Path(args.rules).read_text())
+        fallbacks = [item for arg in args.dns_fallbacks for item in shlex.split(arg)]
+        config = merge(subscription, policy, args.http_port, fallbacks,
+                       args.enable_api.lower() in ('1', 'true', 'yes'))
+        atomic_write(args.output, yaml.safe_dump(config, allow_unicode=True, sort_keys=False))
+    except (OSError, ValueError, yaml.YAMLError) as error:
+        print(f'❌ 生成运行时配置失败: {error}', file=sys.stderr)
+        return 1
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(main())

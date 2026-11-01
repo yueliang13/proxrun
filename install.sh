@@ -1,125 +1,109 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# simple-proxy · 安装脚本
-#
-#   bash install.sh [--subscription <URL>] [--no-shell] [--port N] [--no-download]
-#
-# 安装内容:
-#   ~/.local/bin/mihomo                 代理内核
-#   ~/.local/bin/simple-proxy           主命令
-#   ~/.local/share/simple-proxy/        数据（订阅配置 / 运行时配置 / 日志 / 规则库）
-#   ~/.config/simple-proxy/             配置（proxy.conf / rules.yaml）
-#   ~/.zshrc 或 ~/.bashrc               shell 集成（可选，提供 proxy-on/off/status）
-# ==============================================================================
-set -uo pipefail
+# 安装/更新：bash install.sh [--subscription URL] [--no-shell] [--port N] [--no-download]
+set -euo pipefail
+SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export SP_BIN_DIR="${SP_BIN_DIR:-$HOME/.local/bin}"
+export SP_DATA_DIR="${SP_DATA_DIR:-$HOME/.local/share/simple-proxy}"
+export SP_CONFIG_DIR="${SP_CONFIG_DIR:-$HOME/.config/simple-proxy}"
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SP_BIN_DIR="${SP_BIN_DIR:-$HOME/.local/bin}"
-SP_DATA_DIR="${SP_DATA_DIR:-$HOME/.local/share/simple-proxy}"
-SP_CONFIG_DIR="${SP_CONFIG_DIR:-$HOME/.config/simple-proxy}"
-
-SUB="" WANT_SHELL=1 DO_DOWNLOAD=1 PORT=""
+_sp_asset() {
+  local rel="$1" path
+  for path in "$SOURCE_DIR/$rel" "$SOURCE_DIR/${rel##*/}" "$SP_BIN_DIR/${rel##*/}"; do
+    [[ -f "$path" ]] && { printf '%s' "$path"; return 0; }
+  done
+  return 1
+}
+. "$(_sp_asset lib/core.sh)"
+SUB="${SIMPLE_PROXY_SUBSCRIPTION:-}" WANT_SHELL=1 DO_DOWNLOAD=1 PORT=""
 while (( $# )); do
   case "$1" in
-    --subscription) SUB="$2"; shift 2;;
+    --subscription|--port)
+      [[ $# -ge 2 && -n "$2" ]] || { sp_err "$1 缺少参数"; exit 1; }
+      if [[ "$1" == --subscription ]]; then SUB="$2"; else PORT="$2"; fi
+      shift 2;;
     --no-shell) WANT_SHELL=0; shift;;
     --no-download) DO_DOWNLOAD=0; shift;;
-    --port) PORT="$2"; shift 2;;
-    -h|--help)
-      sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
-      exit 0;;
-    *) echo "未知选项: $1" >&2; exit 1;;
+    -h|--help) sed -n '2s/^# //p' "${BASH_SOURCE[0]}"; exit 0;;
+    *) sp_err "未知选项: $1"; exit 1;;
   esac
 done
-
-info() { printf '  %s\n' "$*"; }
-ok()   { printf '✅ %s\n' "$*"; }
-err()  { printf '❌ %s\n' "$*" >&2; }
-
-echo "── simple-proxy 安装 ──"
-mkdir -p "$SP_BIN_DIR" "$SP_DATA_DIR" "$SP_CONFIG_DIR"
-info "bin   : $SP_BIN_DIR"
-info "data  : $SP_DATA_DIR"
-info "config: $SP_CONFIG_DIR"
-
-# ── 1. 配置与规则 ─────────────────────────────────────────────────────────────
-for f in proxy.conf rules.yaml; do
-  [[ -f "$SP_CONFIG_DIR/$f" ]] || cp "$REPO_DIR/config/$f" "$SP_CONFIG_DIR/$f"
-done
-info "配置与规则就绪"
-
-# ── 2. 内核 ──────────────────────────────────────────────────────────────────
-if (( DO_DOWNLOAD )); then
-  MIHOMO_VERSION="$(grep -oE '^SP_MIHOMO_VERSION=.*' "$SP_CONFIG_DIR/proxy.conf" | cut -d= -f2 | tr -d '"')"
-  MIHOMO_VERSION="${MIHOMO_VERSION:-1.19.33}"
-  case "$(uname -s)" in
-    Linux)  os=linux;;
-    Darwin) os=darwin;;
-    *) err "暂不支持的系统: $(uname -s)"; exit 1;;
-  esac
-  case "$(uname -m)" in
-    x86_64|amd64) arch=x86_64;;
-    aarch64|arm64) arch=aarch64;;
-    *) err "暂不支持的架构: $(uname -m)"; exit 1;;
-  esac
-  url="https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}/mihomo-${os}-${arch}-compatible-v${MIHOMO_VERSION}.gz"
-  info "下载 mihomo v${MIHOMO_VERSION} (${os}/${arch}) ..."
-  if curl -fsSL --max-time 300 -o /tmp/sp-mihomo.gz "$url"; then
-    gunzip -f /tmp/sp-mihomo.gz && install -m 755 /tmp/sp-mihomo.gz "$SP_BIN_DIR/mihomo" && rm -f /tmp/sp-mihomo.gz
-    ok "mihomo 已安装"
-  else
-    rm -f /tmp/sp-mihomo.gz
-    err "mihomo 下载失败，可稍后重试或用 --no-download 自行安装"
-  fi
-fi
-
-# ── 3. 主命令与内部文件 ──────────────────────────────────────────────────────
-install -m 755 "$REPO_DIR/bin/simple-proxy" "$SP_BIN_DIR/simple-proxy"
-install -m 644 "$REPO_DIR/lib/core.sh"            "$SP_DATA_DIR/core.sh"
-install -m 755 "$REPO_DIR/lib/build-config.py"   "$SP_DATA_DIR/build-config.py"
-install -m 644 "$REPO_DIR/lib/shell.sh"           "$SP_DATA_DIR/shell.sh"
-install -m 755 "$REPO_DIR/scripts/clean-logs.sh" "$SP_DATA_DIR/clean-logs.sh"
-install -m 755 "$REPO_DIR/scripts/update-subscription.sh" "$SP_DATA_DIR/update-subscription.sh"
-ok "命令已安装: $SP_BIN_DIR/simple-proxy"
-
-# ── 4. 端口 ──────────────────────────────────────────────────────────────────
 if [[ -n "$PORT" ]]; then
-  if grep -q '^SP_HTTP_PORT=' "$SP_CONFIG_DIR/proxy.conf"; then
-    sed -i "s/^SP_HTTP_PORT=.*/SP_HTTP_PORT=$PORT/" "$SP_CONFIG_DIR/proxy.conf"
-  else
-    echo "SP_HTTP_PORT=$PORT" >> "$SP_CONFIG_DIR/proxy.conf"
+  [[ "$PORT" =~ ^[0-9]{1,5}$ ]] && (( 10#$PORT >= 1 && 10#$PORT <= 65535 )) \
+    || { sp_err "HTTP 端口必须在 1–65535 之间"; exit 1; }
+fi
+mkdir -p "$SP_BIN_DIR" "$SP_DATA_DIR" "$SP_CONFIG_DIR"
+for name in proxy.conf rules.yaml; do
+  if [[ ! -f "$SP_CONFIG_DIR/$name" ]]; then
+    if [[ -f "$SOURCE_DIR/config/$name" ]]; then
+      cp "$SOURCE_DIR/config/$name" "$SP_CONFIG_DIR/$name"
+    else
+      cp "$SOURCE_DIR/$name.default" "$SP_CONFIG_DIR/$name"
+    fi
   fi
-  info "HTTP 端口设为 $PORT"
+done
+if [[ -n "$PORT" ]]; then
+  python3 - "$SP_CONFIG_DIR/proxy.conf" "$PORT" <<'PY'
+from pathlib import Path
+import re,sys
+p=Path(sys.argv[1]);text=p.read_text()
+text=re.sub(r'^SP_HTTP_PORT=.*$', 'SP_HTTP_PORT='+str(int(sys.argv[2])), text, flags=re.M)
+p.write_text(text)
+PY
+  export SP_HTTP_PORT="$PORT"
 fi
-
-# ── 5. 订阅 ──────────────────────────────────────────────────────────────────
-if [[ -n "$SUB" ]]; then
-  bash "$SP_DATA_DIR/update-subscription.sh" "$SUB" "$SP_DATA_DIR/config.yaml" || true
+sp_load_config
+# PyYAML 缺失时安装到持久数据目录，不修改系统 Python。
+if ! PYTHONPATH="$SP_DATA_DIR/vendor${PYTHONPATH:+:$PYTHONPATH}" python3 -c 'import yaml' 2>/dev/null; then
+  python3 -m pip install --disable-pip-version-check --target "$SP_DATA_DIR/vendor" 'PyYAML==6.0.3'
 fi
-
-# ── 6. shell 集成 ────────────────────────────────────────────────────────────
-if (( WANT_SHELL )); then
-  case "${SHELL:-}" in
-    */zsh) rc="${ZDOTDIR:-$HOME}/.zshrc";;
-    *)     rc="$HOME/.bashrc";;
+if (( DO_DOWNLOAD )); then
+  case "$(uname -s)" in Linux) os=linux;; Darwin) os=darwin;; *) sp_err '不支持的系统'; exit 1;; esac
+  case "$(uname -m)" in
+    x86_64|amd64) arch=amd64-compatible;;
+    aarch64|arm64) arch=arm64;;
+    *) sp_err '不支持的架构'; exit 1;;
   esac
-  if ! grep -q 'simple-proxy/shell.sh' "$rc" 2>/dev/null; then
-    cat >> "$rc" <<'EOF'
-
-# ─── simple-proxy ───
-if [ -r "$HOME/.local/share/simple-proxy/shell.sh" ]; then
-  . "$HOME/.local/share/simple-proxy/shell.sh"
+  url="https://github.com/MetaCubeX/mihomo/releases/download/v$SP_MIHOMO_VERSION/mihomo-$os-$arch-v$SP_MIHOMO_VERSION.gz"
+  download_dir="$(mktemp -d "$SP_BIN_DIR/.mihomo-install.XXXXXX")"
+  trap 'rm -rf "$download_dir"' EXIT
+  printf '→ 下载 mihomo v%s (%s/%s)\n' "$SP_MIHOMO_VERSION" "$os" "$arch" >&2
+  curl -fsSL --max-time 300 -o "$download_dir/kernel.gz" "$url"
+  gzip -dc "$download_dir/kernel.gz" > "$download_dir/mihomo"
+  chmod 755 "$download_dir/mihomo"
+  "$download_dir/mihomo" -v >/dev/null
+  mv -f "$download_dir/mihomo" "$SP_MIHOMO_BIN"
+  rm -rf "$download_dir"
+  trap - EXIT
 fi
-EOF
-    ok "shell 集成已写入: $rc"
-  else
-    info "shell 集成已存在: $rc"
+copy_asset() {
+  local source target="$2"
+  source="$(_sp_asset "$1")"
+  [[ "$source" -ef "$target" ]] || install -m 755 "$source" "$target"
+}
+copy_asset bin/simple-proxy "$SP_BIN_DIR/simple-proxy"
+for file in lib/core.sh lib/runtime.py lib/build-config.py lib/shell.sh scripts/clean-logs.sh scripts/update-subscription.sh install.sh uninstall.sh; do
+  copy_asset "$file" "$SP_DATA_DIR/${file##*/}"
+done
+for name in proxy.conf rules.yaml; do
+  if [[ -f "$SOURCE_DIR/config/$name" ]]; then
+    install -m 644 "$SOURCE_DIR/config/$name" "$SP_DATA_DIR/$name.default"
   fi
+done
+if [[ -n "$SUB" ]]; then
+  bash "$SP_DATA_DIR/update-subscription.sh" "$SUB" "$SP_SUBSCRIPTION_CONFIG"
 fi
-
-echo ""
-echo "── 下一步 ──"
-echo "  1) 填订阅:   simple-proxy update '<URL>'"
-echo "  2) 自检:     simple-proxy check"
-echo "  3) 使用:     simple-proxy on curl https://api.ipify.org"
-echo "  4) 快捷命令: proxy-on / proxy-off / proxy-status"
+if (( WANT_SHELL )); then
+  case "${SHELL:-}" in */zsh) rc="${ZDOTDIR:-$HOME}/.zshrc";; *) rc="$HOME/.bashrc";; esac
+  mkdir -p "$(dirname "$rc")"
+  python3 - "$rc" "$SP_DATA_DIR/shell.sh" "$SP_BIN_DIR" "$SP_DATA_DIR" "$SP_CONFIG_DIR" <<'PY'
+from pathlib import Path
+import shlex,sys,re
+p=Path(sys.argv[1]);text=p.read_text() if p.exists() else ''
+text=re.sub(r'\n?# ─── simple-proxy ───\nif \[ -r .*?\nfi\n?', '\n', text, flags=re.S)
+path=shlex.quote(sys.argv[2])
+paths=' '.join(key+'='+shlex.quote(value) for key,value in zip(('SP_BIN_DIR','SP_DATA_DIR','SP_CONFIG_DIR'), sys.argv[3:]))
+text+='\n# ─── simple-proxy ───\nif [ -r '+path+' ]; then\n  export '+paths+'; . '+path+'\nfi\n'
+p.write_text(text)
+PY
+fi
+printf '✅ 安装完成。运行 simple-proxy check 自检。\n'

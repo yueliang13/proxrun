@@ -1,12 +1,5 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# simple-proxy · core
-#
-# 核心实现：启动/停止 mihomo、注入代理环境、生成运行时配置、状态与自检。
-# 所有可调项都来自配置文件（$SP_CONFIG_DIR/proxy.conf），可用环境变量覆盖。
-# ==============================================================================
-
-# ── 路径 ─────────────────────────────────────────────────────────────────────
+# 配置优先级：环境变量 > 用户配置 > 默认值。运行状态由 runtime.py 统一管理。
 sp_resolve_dirs() {
   SP_BIN_DIR="${SP_BIN_DIR:-$HOME/.local/bin}"
   SP_DATA_DIR="${SP_DATA_DIR:-$HOME/.local/share/simple-proxy}"
@@ -20,155 +13,50 @@ sp_resolve_dirs() {
   SP_SUBSCRIPTION_CONFIG="$SP_DATA_DIR/config.yaml"
 }
 
-# ── 配置 ─────────────────────────────────────────────────────────────────────
 sp_load_config() {
+  local name assignment
+  local -a overrides=()
+  while IFS= read -r name; do
+    [[ "$name" == SP_* ]] && overrides+=("$name=${!name}")
+  done < <(compgen -e)
+  SP_CONF_FILE="${SP_CONF_FILE:-${SP_CONFIG_DIR:-$HOME/.config/simple-proxy}/proxy.conf}"
+  if [[ -r "$SP_CONF_FILE" ]]; then
+    . "$SP_CONF_FILE"
+  fi
+  for assignment in "${overrides[@]}"; do export "$assignment"; done
   sp_resolve_dirs
-  # 默认值（可被配置文件和环境变量覆盖）
   SP_HTTP_PORT="${SP_HTTP_PORT:-7890}"
   SP_LOG_KEEP_DAYS="${SP_LOG_KEEP_DAYS:-3}"
   SP_MIHOMO_VERSION="${SP_MIHOMO_VERSION:-1.19.33}"
-  SP_PROXY_URL="http://127.0.0.1:${SP_HTTP_PORT}"
-  # DNS 回退列表：系统解析器优先（由 build-config.py 探测），这里是备用
-  SP_DNS_FALLBACKS="${SP_DNS_FALLBACKS:-https://1.1.1.1/dns-query https://8.8.8.8/dns-query}"
-  # 客户端 NO_PROXY 追加项
-  SP_NO_PROXY_EXTRA="${SP_NO_PROXY_EXTRA:-localhost,127.0.0.1,.svc,.svc.cluster.local,10.0.0.0/8,10.42.0.0/16,10.43.0.0/16,10.254.0.0/16,10.255.0.0/16}"
-  # 是否开启 mihomo 的控制 API（默认关闭，减少暴露面）
+  SP_DNS_FALLBACKS="${SP_DNS_FALLBACKS-https://doh.pub/dns-query https://dns.alidns.com/dns-query}"
+  SP_NO_PROXY_EXTRA="${SP_NO_PROXY_EXTRA-localhost,127.0.0.1,::1,.local,.svc,.svc.cluster.local,registry.qz.local,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}"
   SP_ENABLE_API="${SP_ENABLE_API:-0}"
-
-  if [[ -r "$SP_CONF_FILE" ]]; then
-    # shellcheck disable=SC1090
-    . "$SP_CONF_FILE"
-    sp_resolve_dirs   # 配置文件可能改了路径
+  if [[ ! "$SP_HTTP_PORT" =~ ^[0-9]{1,5}$ ]] || (( 10#$SP_HTTP_PORT < 1 || 10#$SP_HTTP_PORT > 65535 )); then
+    sp_err "HTTP 端口必须在 1–65535 之间"; return 1
   fi
+  SP_HTTP_PORT=$((10#$SP_HTTP_PORT))
+  SP_PROXY_URL="http://127.0.0.1:$SP_HTTP_PORT"
+  SP_BUILDER="$(_sp_asset lib/build-config.py)" || return 1
+  SP_CLEANER="$(_sp_asset scripts/clean-logs.sh)" || return 1
+  SP_RUNTIME="$(_sp_asset lib/runtime.py)" || return 1
+  export SP_BIN_DIR SP_DATA_DIR SP_CONFIG_DIR SP_RULES_FILE SP_CONF_FILE SP_MIHOMO_BIN
+  export SP_HTTP_PORT SP_LOG_KEEP_DAYS SP_MIHOMO_VERSION SP_DNS_FALLBACKS SP_NO_PROXY_EXTRA SP_ENABLE_API
+  export SP_BUILDER SP_CLEANER
 }
 
-# ── 内部工具 ─────────────────────────────────────────────────────────────────
-sp_log()  { printf '%s\n' "$*" >&2; }
-sp_err()  { printf '❌ %s\n' "$*" >&2; }
-sp_ok()   { printf '✅ %s\n' "$*" >&2; }
-sp_warn() { printf '⚠️  %s\n' "$*" >&2; }
-
-sp_running() {
-  [[ -f "$SP_PID_FILE" ]] && kill -0 "$(cat "$SP_PID_FILE" 2>/dev/null)" 2>/dev/null
-}
-
-# 端口探测：zsh 不支持 /dev/tcp，必须借道 bash
+sp_err() { printf '❌ %s\n' "$*" >&2; }
+sp_runtime() { python3 "$SP_RUNTIME" "$@"; }
+sp_running() { sp_runtime running; }
+sp_stop() { sp_runtime off; }
+sp_status() { sp_runtime status; }
 sp_port_open() {
-  bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" 2>/dev/null
-}
-
-# ── 运行时配置生成 ───────────────────────────────────────────────────────────
-sp_build_config() {
-  local builder="$SP_DATA_DIR/build-config.py"
-  [[ -r "$builder" ]] || builder="$SP_SCRIPT_DIR/lib/build-config.py"
-  [[ -r "$builder" ]] || { sp_err "找不到 build-config.py"; return 1; }
-
-  python3 "$builder" \
-      --subscription-config "$SP_SUBSCRIPTION_CONFIG" \
-      --rules "$SP_RULES_FILE" \
-      --output "$SP_RUNTIME_CONFIG" \
-      --dns-fallbacks "$SP_DNS_FALLBACKS" \
-      --http-port "$SP_HTTP_PORT" \
-      --enable-api "$SP_ENABLE_API" \
-      --data-dir "$SP_DATA_DIR" \
-    || return 1
-  chmod 600 "$SP_RUNTIME_CONFIG" 2>/dev/null
-}
-
-# ── 日志轮转 ─────────────────────────────────────────────────────────────────
-sp_clean_logs() {
-  local cleaner="$SP_DATA_DIR/clean-logs.sh"
-  [[ -r "$cleaner" ]] || cleaner="$SP_SCRIPT_DIR/scripts/clean-logs.sh"
-  [[ -r "$cleaner" ]] && bash "$cleaner" "$SP_DATA_DIR" "$SP_LOG_KEEP_DAYS" 2>/dev/null
-  return 0
-}
-
-# ── 启动 ─────────────────────────────────────────────────────────────────────
-sp_start() {
-  sp_running && return 0
-
-  if [[ ! -x "$SP_MIHOMO_BIN" ]]; then
-    sp_err "找不到 mihomo: $SP_MIHOMO_BIN"
-    sp_err "请先运行: simple-proxy install"
-    return 1
-  fi
-  if [[ ! -f "$SP_SUBSCRIPTION_CONFIG" ]]; then
-    sp_err "缺少订阅配置: $SP_SUBSCRIPTION_CONFIG"
-    sp_err "请先运行: simple-proxy update --subscription '<URL>'"
-    return 1
-  fi
-
-  sp_build_config || { sp_err "生成运行时配置失败"; return 1; }
-  sp_clean_logs
-
-  # ① 在当前 shell 启动（保持为子进程 → 停止时可 wait 回收，不留僵尸）
-  # ② 在 mihomo 家目录启动（geo 缓存写这里），但立刻还原用户的工作目录
-  # ③ 关闭 zsh/bash 的作业通知，避免输出 [2] pid / + done 噪音
-  local oldpwd="$PWD"
-  cd "$SP_DATA_DIR" || return 1
-  setopt no_monitor 2>/dev/null || true
-  nohup "$SP_MIHOMO_BIN" -d "$SP_DATA_DIR" -f "$SP_RUNTIME_CONFIG" \
-        >>"$SP_LOG_FILE" 2>&1 &
-  SP_MIHOMO_PID=$!
-  cd "$oldpwd" || true
-  echo "$SP_MIHOMO_PID" > "$SP_PID_FILE"
-
-  local i
-  for i in $(seq 1 60); do
-    if sp_port_open "$SP_HTTP_PORT"; then
-      return 0
-    fi
-    if ! kill -0 "$SP_MIHOMO_PID" 2>/dev/null; then
-      sp_err "mihomo 启动失败，日志尾部："
-      tail -n 15 "$SP_LOG_FILE" >&2
-      rm -f "$SP_PID_FILE"
-      return 1
-    fi
-    sleep 0.5
-  done
-  sp_err "等待端口 $SP_HTTP_PORT 超时"
-  return 1
-}
-
-# ── 停止 ─────────────────────────────────────────────────────────────────────
-sp_stop() {
-  [[ -f "$SP_PID_FILE" ]] || return 0
-  local pid; pid="$(cat "$SP_PID_FILE")"
-  if kill -0 "$pid" 2>/dev/null; then
-    kill "$pid" 2>/dev/null
-    local i
-    for i in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
-    kill -9 "$pid" 2>/dev/null
-    # 若是本 shell 的子进程 → 立即回收，避免僵尸
-    if [[ "${SP_MIHOMO_PID:-}" == "$pid" ]]; then
-      wait "$pid" 2>/dev/null
-      unset SP_MIHOMO_PID
-    fi
-  fi
-  rm -f "$SP_PID_FILE"
-  setopt monitor 2>/dev/null || true
-  return 0
-}
-
-# ── 代理环境注入（仅子进程）───────────────────────────────────────────────────
-sp_env() {
-  export http_proxy="$SP_PROXY_URL"  https_proxy="$SP_PROXY_URL"
-  export HTTP_PROXY="$SP_PROXY_URL"  HTTPS_PROXY="$SP_PROXY_URL"
-  export no_proxy="${no_proxy:+$no_proxy,}$SP_NO_PROXY_EXTRA"
-  export NO_PROXY="$no_proxy"
-}
-
-# ── 状态 ─────────────────────────────────────────────────────────────────────
-sp_status() {
-  if sp_running; then
-    printf '● mihomo: 运行中 (pid %s)  HTTP 代理 %s\n' "$(cat "$SP_PID_FILE")" "$SP_PROXY_URL"
-  else
-    printf '○ mihomo: 未运行\n'
-  fi
-  printf '  端口      : %s\n' "$SP_HTTP_PORT"
-  printf '  数据目录  : %s\n' "$SP_DATA_DIR"
-  printf '  配置文件  : %s\n' "$SP_RUNTIME_CONFIG"
-  printf '  规则文件  : %s\n' "$SP_RULES_FILE"
+  python3 - "$1" <<'PORT'
+import socket, sys
+try:
+    with socket.create_connection(('127.0.0.1', int(sys.argv[1])), timeout=.2): pass
+except OSError:
+    sys.exit(1)
+PORT
 }
 
 # ── 自检 ─────────────────────────────────────────────────────────────────────
@@ -185,7 +73,7 @@ sp_check() {
 
   # 订阅配置
   if [[ -f "$SP_SUBSCRIPTION_CONFIG" ]]; then
-    printf '  ✓ 订阅配置  : %s (mode %s)\n' "$SP_SUBSCRIPTION_CONFIG" "$(stat -c '%a' "$SP_SUBSCRIPTION_CONFIG" 2>/dev/null)"
+    printf '  ✓ 订阅配置  : %s (mode %s)\n' "$SP_SUBSCRIPTION_CONFIG" "$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$SP_SUBSCRIPTION_CONFIG")"
   else
     printf '  ✗ 订阅配置缺失: %s\n' "$SP_SUBSCRIPTION_CONFIG"; fail=1
   fi
@@ -197,6 +85,11 @@ sp_check() {
     printf '  ✗ 规则文件缺失: %s\n' "$SP_RULES_FILE"; fail=1
   fi
 
+  # YAML 依赖
+  PYTHONPATH="$SP_DATA_DIR/vendor${PYTHONPATH:+:$PYTHONPATH}" python3 -c "import yaml" 2>/dev/null \
+    && printf '  ✓ PyYAML    : 可用\n' \
+    || { printf '  ✗ 缺少 PyYAML，请重新安装\n'; fail=1; }
+
   # python
   command -v python3 >/dev/null 2>&1 \
     && printf '  ✓ python3   : %s\n' "$(command -v python3)" \
@@ -207,13 +100,13 @@ sp_check() {
     if infocmp "${TERM:-xterm}" >/dev/null 2>&1; then
       printf '  ✓ terminfo  : %s 可解析\n' "${TERM:-xterm}"
     else
-      printf '  ⚠ terminfo  : 系统不认识 TERM=%s —— 建议 simple-proxy check --fix-term 或手动安装对应 terminfo\n' "${TERM:-xterm}"
+      printf '  ⚠ terminfo  : 系统不认识 TERM=%s —— 建议手动安装对应 terminfo\n' "${TERM:-xterm}"
     fi
   fi
 
   # 进程与端口
   if sp_running; then
-    printf '  ✓ 进程      : 运行中 (pid %s)\n' "$(cat "$SP_PID_FILE")"
+    printf '  ✓ 进程      : 运行中 (pid %s)\n' "$(cat "$SP_PID_FILE" 2>/dev/null)"
   else
     printf '  ○ 进程      : 未运行\n'
   fi

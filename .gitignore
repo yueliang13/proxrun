@@ -1,15 +1,53 @@
-# 运行时产物（不应进版本库）
-*.log
-*.log.*
-cache.db
+# 本地设计和运维文档
+/docs/
+
+# 个人订阅和运行配置（可能包含节点凭据）；保留 config/ 中的公开模板
 config.yaml
 config.runtime.yaml
+config.yaml.*.tmp
+config.runtime.yaml.*.tmp
+.sub
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# 运行状态、日志和内核缓存
+*.log
+*.log.*
 *.pid
+mihomo.state.json
+runtime.lock
+.state-*
+cache.db*
+GeoIP.dat
+GeoSite.dat
+*.mmdb
 
-# 本地试验目录
+# 下载的内核及安装临时目录
+/bin/mihomo
+/mihomo
+.mihomo-install.*/
+
+# 本地依赖和试验目录
 /tmp/
-tmp/
+/.tmp/
+/.venv/
+/venv/
+/lib/vendor/
 
-# Python 缓存
+# Python 缓存和测试产物
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# 编辑器和系统临时文件
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
