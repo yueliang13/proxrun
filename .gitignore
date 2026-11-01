@@ -36,7 +36,7 @@ GeoSite.dat
 /venv/
 /lib/vendor/
 
-# Python 缓存和测试产物
+# 工具缓存和测试产物
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -51,3 +51,9 @@ htmlcov/
 *.swo
 *~
 .DS_Store
+
+# Go 构建产物
+/dist/
+*.test
+coverage.out
+.proxrun-*.tmp

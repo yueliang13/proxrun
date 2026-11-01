@@ -1,16 +1,20 @@
 # shell 快捷命令。常驻模式由当前 shell 保留一个可 wait 的内核父进程。
-typeset -ga _SIMPLE_PROXY_HOLDERS
-_simple_proxy_bin() {
+typeset -ga _PROXRUN_HOLDERS
+if typeset -p _SIMPLE_PROXY_HOLDERS >/dev/null 2>&1; then
+  _PROXRUN_HOLDERS+=("${_SIMPLE_PROXY_HOLDERS[@]}")
+  unset _SIMPLE_PROXY_HOLDERS
+fi
+_proxrun_bin() {
   local candidate
-  for candidate in "${SP_BIN_DIR:-$HOME/.local/bin}/simple-proxy" "$HOME/.local/bin/simple-proxy"; do
+  for candidate in "${PROXRUN_BIN_DIR:-${SP_BIN_DIR:-$HOME/.local/bin}}/proxrun" "$HOME/.local/bin/proxrun"; do
     [[ -x "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
   done
-  command -v simple-proxy 2>/dev/null
+  command -v proxrun 2>/dev/null
 }
 
 proxy-on() {
   local binary rc holder ready count monitor_was_on=0
-  binary="$(_simple_proxy_bin)" || return 127
+  binary="$(_proxrun_bin)" || return 127
   if [[ "${1:-}" == --start && $# -gt 1 ]] && ! "$binary" _kept; then
     ready="$(mktemp -d)" || return 1
     if [[ -n "${ZSH_VERSION:-}" ]]; then
@@ -23,7 +27,7 @@ proxy-on() {
       "$binary" _hold "$ready" >"$ready/output" 2>&1 &
       holder=$!
     } 2>/dev/null
-    _SIMPLE_PROXY_HOLDERS+=("$holder")
+    _PROXRUN_HOLDERS+=("$holder")
     count=0
     while [[ ! -f "$ready/ready" ]]; do
       if ! kill -0 "$holder" 2>/dev/null || (( count >= 650 )); then
@@ -50,17 +54,17 @@ po() {
 
 proxy-off() {
   local binary holder
-  binary="$(_simple_proxy_bin)" || return 127
+  binary="$(_proxrun_bin)" || return 127
   "$binary" off || return $?
   [[ -z "${ZSH_VERSION:-}" ]] || setopt local_options no_monitor
-  for holder in "${_SIMPLE_PROXY_HOLDERS[@]}"; do
+  for holder in "${_PROXRUN_HOLDERS[@]}"; do
     wait "$holder" 2>/dev/null || true
   done
-  _SIMPLE_PROXY_HOLDERS=()
+  _PROXRUN_HOLDERS=()
 }
 
 proxy-status() {
   local binary
-  binary="$(_simple_proxy_bin)" || return 127
+  binary="$(_proxrun_bin)" || return 127
   "$binary" status "$@"
 }
